@@ -46,6 +46,14 @@ It acts as a semantic memory layer on top of the Qdrant database.
                                    If there is a default collection name, this field is not enabled.
    - Returns: Confirmation message
    - This tool is disabled when `QDRANT_READ_ONLY` is enabled.
+4. `qdrant-delete`
+   - Delete a memory from the Qdrant database by semantic search
+   - Input:
+     - `query` (string): Semantic search query to find the memory to delete
+     - `collection_name` (string): Name of the collection to delete from. This field is required if there is no default collection name.
+                                   If there is a default collection name, this field is not enabled.
+   - Returns: Confirmation of deleted memory content
+   - This tool is disabled when `QDRANT_READ_ONLY` is enabled.
 
 ## Environment Variables
 
@@ -65,8 +73,9 @@ Configuration is done via environment variables. The only command-line argument 
 | `TOOL_STORE_DESCRIPTION` | Custom description for the store tool                               | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
 | `TOOL_FIND_DESCRIPTION`  | Custom description for the find tool                                | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
 | `TOOL_UPDATE_DESCRIPTION`| Custom description for the update tool                              | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
+| `TOOL_DELETE_DESCRIPTION`| Custom description for the delete tool                              | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
 | `QDRANT_SEARCH_LIMIT`    | Maximum number of results to return from search                     | `10`                                                              |
-| `QDRANT_READ_ONLY`       | Enable read-only mode (disables `qdrant-store` and `qdrant-update`) | `false`                                                           |
+| `QDRANT_READ_ONLY`       | Enable read-only mode (disables mutation tools)                      | `false`                                                           |
 
 ### FastMCP Environment Variables
 
