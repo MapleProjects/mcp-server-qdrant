@@ -281,7 +281,6 @@ class QdrantMCPServer(FastMCP):
                 delete_foo,
                 {"collection_name": self.qdrant_settings.collection_name},
             )
-            )
 
         self.tool(
             find_foo,

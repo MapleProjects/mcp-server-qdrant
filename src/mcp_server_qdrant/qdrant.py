@@ -51,7 +51,10 @@ class QdrantConnector:
         self._default_collection_name = collection_name
         self._embedding_provider = embedding_provider
         self._client = AsyncQdrantClient(
-            location=qdrant_url, api_key=qdrant_api_key, path=qdrant_local_path
+            location=qdrant_url,
+            api_key=qdrant_api_key,
+            path=qdrant_local_path,
+            check_compatibility=False,
         )
         self._field_indexes = field_indexes
 
