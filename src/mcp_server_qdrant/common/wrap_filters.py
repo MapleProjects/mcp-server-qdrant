@@ -17,8 +17,7 @@ def wrap_filters(
 
     sig = inspect.signature(original_func)
 
-    @wraps(original_func)
-    def wrapper(*args, **kwargs):
+    def _build_filter(kwargs: dict) -> dict:
         # Start with fixed values
         filter_values = {}
 
@@ -26,9 +25,23 @@ def wrap_filters(
             if field_name in kwargs:
                 filter_values[field_name] = kwargs.pop(field_name)
 
-        query_filter = make_filter(filterable_fields, filter_values)
+        return make_filter(filterable_fields, filter_values)
 
-        return original_func(**kwargs, query_filter=query_filter)
+    if inspect.iscoroutinefunction(original_func):
+
+        async def _async_invoke(*args, **kwargs):
+            query_filter = _build_filter(kwargs)
+            return await original_func(*args, **kwargs, query_filter=query_filter)
+
+        wrapper = wraps(original_func)(_async_invoke)
+
+    else:
+
+        def _sync_invoke(*args, **kwargs):
+            query_filter = _build_filter(kwargs)
+            return original_func(*args, **kwargs, query_filter=query_filter)
+
+        wrapper = wraps(original_func)(_sync_invoke)
 
     # Replace `query_filter` signature with parameters from `filterable_fields`
 

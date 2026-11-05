@@ -9,8 +9,13 @@ DEFAULT_TOOL_STORE_DESCRIPTION = (
     "Keep the memory for later use, when you are asked to remember something."
 )
 DEFAULT_TOOL_DELETE_DESCRIPTION = (
-    "Delete a memory from Qdrant by semantic search. "
-    "The closest matching memory will be removed."
+    "Delete a memory from Qdrant. Two modes, exactly one per call: \n"
+    " - 'point_id': delete the exact memory with that id, as returned by the find "
+    "tool. Deterministic and preferred when the id is known. \n"
+    " - 'query': delete the closest semantic matches. Use 'limit' to cap how many, "
+    "'score_threshold' to avoid deleting an unrelated memory, and 'dry_run' to "
+    "preview the matches before removing them. \n"
+    "The response lists the id, the score and a preview of every deleted memory."
 )
 DEFAULT_TOOL_FIND_DESCRIPTION = (
     "Look up memories in Qdrant. Use this tool when you need to: \n"

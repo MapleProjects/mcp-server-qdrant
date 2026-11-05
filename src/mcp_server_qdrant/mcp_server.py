@@ -1,6 +1,7 @@
 import json
 import logging
 from typing import Annotated, Any, Optional
+from xml.sax.saxutils import escape
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
@@ -19,6 +20,19 @@ from mcp_server_qdrant.settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Hard ceiling for a single search or delete call. A client asking for more is
+# almost always a mistake, and an unbounded limit can pull the whole collection
+# into the response.
+MAX_RESULTS = 100
+
+
+def _clamp_limit(limit: int | None, default: int) -> int:
+    if limit is None:
+        return default
+    if limit < 1:
+        raise ValueError("'limit' must be at least 1.")
+    return min(limit, MAX_RESULTS)
 
 
 # FastMCP is an alternative interface for declaring the capabilities
@@ -84,9 +98,11 @@ class QdrantMCPServer(FastMCP):
         """
         entry_metadata = json.dumps(entry.metadata) if entry.metadata else ""
         entry_id = entry.id or ""
+        score = f"<score>{entry.score:.4f}</score>" if entry.score is not None else ""
         return (
-            f"<entry><id>{entry_id}</id><content>{entry.content}</content>"
-            f"<metadata>{entry_metadata}</metadata></entry>"
+            f"<entry><id>{escape(entry_id)}</id>"
+            f"<content>{escape(entry.content)}</content>"
+            f"<metadata>{escape(entry_metadata)}</metadata>{score}</entry>"
         )
 
     def setup_tools(self):
@@ -117,16 +133,23 @@ class QdrantMCPServer(FastMCP):
             :param metadata: JSON metadata to store with the information, optional.
             :param collection_name: The name of the collection to store the information in, optional. If not provided,
                                     the default collection is used.
-            :return: A message indicating that the information was stored.
+            :return: A message indicating that the information was stored, including its id.
             """
             await ctx.debug(f"Storing information {information} in Qdrant")
 
             entry = Entry(content=information, metadata=metadata)
 
-            await self.qdrant_connector.store(entry, collection_name=collection_name)
-            if collection_name:
-                return f"Remembered: {information} in collection {collection_name}"
-            return f"Remembered: {information}"
+            try:
+                stored = await self.qdrant_connector.store(
+                    entry, collection_name=collection_name
+                )
+            except ValueError as e:
+                return f"Could not store the memory: {e}"
+
+            return (
+                f"Remembered: {information} "
+                f"(id: {stored.id}, collection: {collection_name})"
+            )
 
         async def find(
             ctx: Context,
@@ -142,6 +165,13 @@ class QdrantMCPServer(FastMCP):
                     "Defaults to the server's configured search limit."
                 ),
             ] = None,
+            score_threshold: Annotated[
+                float | None,
+                Field(
+                    description="Minimum similarity score, between 0 and 1 for cosine "
+                    "distance. Results below it are dropped. Optional."
+                ),
+            ] = None,
         ) -> list[str] | None:
             """
             Find memories in Qdrant.
@@ -151,21 +181,27 @@ class QdrantMCPServer(FastMCP):
                                     the default collection is used.
             :param query_filter: The filter to apply to the query.
             :param limit: Maximum number of results, optional. Falls back to the configured search limit.
+            :param score_threshold: Minimum similarity score, optional.
             :return: A list of entries found or None.
             """
 
             # Log query_filter
             await ctx.debug(f"Query filter: {query_filter}")
 
-            query_filter = models.Filter(**query_filter) if query_filter else None
+            try:
+                query_filter = models.Filter(**query_filter) if query_filter else None
+                effective_limit = _clamp_limit(limit, self.qdrant_settings.search_limit)
+            except (ValueError, TypeError) as e:
+                return [f"Invalid search arguments: {e}"]
 
             await ctx.debug(f"Finding results for query {query}")
 
             entries = await self.qdrant_connector.search(
                 query,
                 collection_name=collection_name,
-                limit=limit or self.qdrant_settings.search_limit,
+                limit=effective_limit,
                 query_filter=query_filter,
+                score_threshold=score_threshold,
             )
             if not entries:
                 return None
@@ -206,6 +242,13 @@ class QdrantMCPServer(FastMCP):
                     "metadata. Any json is accepted."
                 ),
             ] = None,
+            clear_metadata: Annotated[
+                bool,
+                Field(
+                    description="Remove the metadata entirely. Cannot be combined "
+                    "with 'metadata'."
+                ),
+            ] = False,
         ) -> str:
             """
             Update an existing memory in Qdrant, identified by its point id.
@@ -214,52 +257,113 @@ class QdrantMCPServer(FastMCP):
             :param collection_name: The name of the collection the memory lives in.
             :param content: The new content, optional. If provided, the memory is re-embedded.
             :param metadata: The new metadata, optional. If provided, it replaces the old metadata.
+            :param clear_metadata: Remove the metadata key entirely, optional.
             :return: A message indicating that the memory was updated.
             """
             await ctx.debug(f"Updating entry {point_id} in Qdrant")
 
             try:
-                await self.qdrant_connector.update(
+                updated = await self.qdrant_connector.update(
                     point_id,
                     content=content,
                     metadata=metadata,
+                    clear_metadata=clear_metadata,
                     collection_name=collection_name,
                 )
             except ValueError as e:
                 return f"Could not update entry {point_id}: {e}"
 
-            if collection_name:
-                return f"Updated entry {point_id} in collection {collection_name}"
-            return f"Updated entry {point_id}"
+            return (
+                f"Updated entry {updated.id} in collection {collection_name}. "
+                f"Current content: {updated.content}"
+            )
 
         async def delete(
             ctx: Context,
-            query: Annotated[
-                str,
-                Field(
-                    description="Semantic search query to find the memory to delete"
-                ),
-            ],
             collection_name: Annotated[
                 str, Field(description="The collection to delete from")
             ],
+            point_id: Annotated[
+                str | None,
+                Field(
+                    description="Exact id of the memory to delete, as returned in the "
+                    "'id' field by the find tool. Use this for a deterministic delete. "
+                    "Mutually exclusive with 'query'."
+                ),
+            ] = None,
+            query: Annotated[
+                str | None,
+                Field(
+                    description="Semantic search query used to find the memories to "
+                    "delete. Mutually exclusive with 'point_id'. Prefer 'point_id' "
+                    "when you already know it."
+                ),
+            ] = None,
+            limit: Annotated[
+                int | None,
+                Field(
+                    description="Maximum number of memories to delete when deleting by "
+                    "query. Defaults to 1."
+                ),
+            ] = None,
+            score_threshold: Annotated[
+                float | None,
+                Field(
+                    description="Minimum similarity score for a match to be deleted. "
+                    "Use it to avoid deleting an unrelated memory. Optional."
+                ),
+            ] = None,
+            dry_run: Annotated[
+                bool,
+                Field(
+                    description="Preview the matches without deleting anything. "
+                    "Recommended before a query-based delete."
+                ),
+            ] = False,
+            query_filter: ArbitraryFilter | None = None,
         ) -> str:
             """
-            Delete a memory from Qdrant by semantic search.
+            Delete a memory from Qdrant, either by exact id or by semantic search.
             :param ctx: The context for the request.
-            :param query: The query to use for finding the memory to delete.
-            :param collection_name: The name of the collection to delete from, optional. If not provided,
-                                    the default collection is used.
-            :return: A message indicating what was deleted.
+            :param collection_name: The name of the collection to delete from.
+            :param point_id: Exact id of the memory to delete, optional.
+            :param query: Semantic query to find the memory to delete, optional.
+            :param limit: Maximum number of memories to delete by query, optional.
+            :param score_threshold: Minimum similarity score to delete, optional.
+            :param dry_run: Preview without deleting, optional.
+            :param query_filter: The filter to apply to the query, optional.
+            :return: A message indicating what was deleted, or what would be deleted.
             """
-            await ctx.debug(f"Deleting memory matching '{query}'")
-            deleted = await self.qdrant_connector.delete(
-                query, collection_name=collection_name
-            )
+            await ctx.debug(f"Deleting memory (point_id={point_id}, query={query})")
+
+            try:
+                effective_limit = _clamp_limit(limit, 1)
+                parsed_filter = models.Filter(**query_filter) if query_filter else None
+                deleted = await self.qdrant_connector.delete(
+                    query,
+                    point_id=point_id,
+                    collection_name=collection_name,
+                    limit=effective_limit,
+                    score_threshold=score_threshold,
+                    query_filter=parsed_filter,
+                    dry_run=dry_run,
+                )
+            except (ValueError, TypeError) as e:
+                return f"Could not delete: {e}"
+
             if not deleted:
-                return f"No matching memory found for: {query}"
-            contents = [entry.content[:100] for entry in deleted]
-            return f"Deleted {len(deleted)} memory(ies): {contents}"
+                target = point_id if point_id is not None else query
+                return f"No matching memory found for: {target}"
+
+            verb = "Would delete" if dry_run else "Deleted"
+            lines = [f"{verb} {len(deleted)} memory(ies):"]
+            for entry in deleted:
+                score = f" (score {entry.score:.4f})" if entry.score is not None else ""
+                preview = entry.content[:100]
+                if len(entry.content) > 100:
+                    preview += "..."
+                lines.append(f"- id {entry.id}{score}: {preview}")
+            return "\n".join(lines)
 
         find_foo = find
         store_foo = store
@@ -272,8 +376,10 @@ class QdrantMCPServer(FastMCP):
 
         if len(filterable_conditions) > 0:
             find_foo = wrap_filters(find_foo, filterable_conditions)
+            delete_foo = wrap_filters(delete_foo, filterable_conditions)
         elif not self.qdrant_settings.allow_arbitrary_filter:
             find_foo = make_partial_function(find_foo, {"query_filter": None})
+            delete_foo = make_partial_function(delete_foo, {"query_filter": None})
 
         if self.qdrant_settings.collection_name:
             find_foo = make_partial_function(

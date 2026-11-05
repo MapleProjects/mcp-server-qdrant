@@ -25,34 +25,45 @@ It acts as a semantic memory layer on top of the Qdrant database.
      - `metadata` (JSON): Optional metadata to store
      - `collection_name` (string): Name of the collection to store the information in. This field is required if there are no default collection name.
                                    If there is a default collection name, this field is not enabled.
-   - Returns: Confirmation message
+   - Returns: Confirmation message that includes the generated `id`, so the entry can be
+     updated or deleted later without a search.
 2. `qdrant-find`
    - Retrieve relevant information from the Qdrant database
    - Input:
      - `query` (string): Query to use for searching
-     - `collection_name` (string): Name of the collection to store the information in. This field is required if there are no default collection name.
+     - `limit` (integer): Optional maximum number of results. Defaults to `QDRANT_SEARCH_LIMIT`, capped at 100.
+     - `score_threshold` (float): Optional minimum similarity score. Results below it are dropped.
+     - `collection_name` (string): Name of the collection to store the information in. This field is required if there is no default collection name.
                                    If there is a default collection name, this field is not enabled.
-   - Returns: Information stored in the Qdrant database as separate messages. Each result includes the entry's `id`, which is required to update it with `qdrant-update`.
+   - Returns: Information stored in the Qdrant database as separate messages. Each result includes the entry's `id`
+     and its similarity `score`. The `id` is required to update or delete the entry.
 3. `qdrant-update`
    - Update an entry that is already stored in the Qdrant database, identified by its `id`.
      First use `qdrant-find` to locate the entry and read its `id`. The content, the metadata,
      or both can be updated; anything left out is kept unchanged. Updating the content re-embeds
-     the entry, while updating only the metadata leaves the vector untouched.
+     the entry in a single atomic write, while updating only the metadata leaves the vector untouched.
    - Input:
      - `point_id` (string): The `id` of the entry to update, as returned by `qdrant-find`.
      - `content` (string): Optional new content. If omitted, the existing content is kept.
      - `metadata` (JSON): Optional new metadata. If provided, it replaces the existing metadata.
+     - `clear_metadata` (boolean): Remove the metadata key entirely. Cannot be combined with `metadata`.
      - `collection_name` (string): Name of the collection the entry lives in. This field is required if there is no default collection name.
                                    If there is a default collection name, this field is not enabled.
-   - Returns: Confirmation message
+   - Returns: Confirmation message with the current content of the entry.
    - This tool is disabled when `QDRANT_READ_ONLY` is enabled.
 4. `qdrant-delete`
-   - Delete a memory from the Qdrant database by semantic search
+   - Delete a memory from the Qdrant database. Two modes, exactly one per call.
    - Input:
-     - `query` (string): Semantic search query to find the memory to delete
+     - `point_id` (string): Exact `id` of the entry to delete, as returned by `qdrant-find`.
+       Deterministic and preferred when the id is known.
+     - `query` (string): Semantic search query used to find the entries to delete.
+     - `limit` (integer): Optional maximum number of entries to delete by query. Defaults to 1, capped at 100.
+     - `score_threshold` (float): Optional minimum similarity score for a match to be deleted.
+       Use it to avoid deleting an unrelated entry.
+     - `dry_run` (boolean): Preview the matches without deleting anything.
      - `collection_name` (string): Name of the collection to delete from. This field is required if there is no default collection name.
                                    If there is a default collection name, this field is not enabled.
-   - Returns: Confirmation of deleted memory content
+   - Returns: The `id`, the `score` and a preview of every deleted entry, or of every match when `dry_run` is set.
    - This tool is disabled when `QDRANT_READ_ONLY` is enabled.
 
 ## Environment Variables
