@@ -1,7 +1,13 @@
+import asyncio
+import hashlib
+import json
 import logging
+import re
 import uuid
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, TypeVar
 
+import httpx
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient, models
 
@@ -14,6 +20,45 @@ Metadata = dict[str, Any]
 ArbitraryFilter = dict[str, Any]
 
 DOCUMENT_PATH = "document"
+CONTENT_HASH_PATH = "content_hash"
+CREATED_AT_PATH = "created_at"
+UPDATED_AT_PATH = "updated_at"
+
+T = TypeVar("T")
+
+# Errors that mean "the server is not reachable right now" rather than "the
+# request is wrong". Only these are retried.
+_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.RemoteProtocolError,
+    ConnectionError,
+    TimeoutError,
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def content_fingerprint(content: str, metadata: Metadata | None) -> str:
+    """Stable hash of the content plus its metadata.
+
+    Two entries with the same text and the same metadata are the same memory.
+    The same text under different metadata is a different memory and is kept.
+    """
+    canonical_metadata = json.dumps(
+        metadata or {}, sort_keys=True, ensure_ascii=False, default=str
+    )
+    payload = f"{_normalize_text(content)}\x00{canonical_metadata}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class Entry(BaseModel):
@@ -30,6 +75,11 @@ class Entry(BaseModel):
     # Cosine similarity of the entry against the query. Only set by `search`
     # and by query-based `delete`.
     score: float | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    # True when `store` found an identical memory and returned it instead of
+    # writing a second copy.
+    duplicate: bool = False
 
 
 class QdrantConnector:
@@ -41,6 +91,9 @@ class QdrantConnector:
                             the collection name to be provided.
     :param embedding_provider: The embedding provider to use.
     :param qdrant_local_path: The path to the storage directory for the Qdrant client, if local mode is used.
+    :param field_indexes: Payload indexes to create with the collection.
+    :param dedupe: Skip a write when an identical content and metadata already exist.
+    :param retries: Attempts for a client call that fails on a transient connection error.
     """
 
     def __init__(
@@ -51,6 +104,8 @@ class QdrantConnector:
         embedding_provider: EmbeddingProvider,
         qdrant_local_path: str | None = None,
         field_indexes: dict[str, models.PayloadSchemaType] | None = None,
+        dedupe: bool = True,
+        retries: int = 3,
     ):
         self._qdrant_url = qdrant_url.rstrip("/") if qdrant_url else None
         self._qdrant_api_key = qdrant_api_key
@@ -63,13 +118,38 @@ class QdrantConnector:
             check_compatibility=False,
         )
         self._field_indexes = field_indexes
+        self._dedupe = dedupe
+        self._retries = max(1, retries)
+
+    async def _call(self, factory: Callable[[], Awaitable[T]]) -> T:
+        """Run a client call, retrying only transient connection failures."""
+        delay = 0.25
+        last: BaseException | None = None
+        for attempt in range(self._retries):
+            try:
+                return await factory()
+            except _TRANSIENT_ERRORS as exc:
+                last = exc
+                if attempt == self._retries - 1:
+                    break
+                logger.warning(
+                    "Qdrant call failed (%s), retry %d/%d in %.2fs",
+                    type(exc).__name__,
+                    attempt + 1,
+                    self._retries - 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+        assert last is not None
+        raise last
 
     async def get_collection_names(self) -> list[str]:
         """
         Get the names of all collections in the Qdrant server.
         :return: A list of collection names.
         """
-        response = await self._client.get_collections()
+        response = await self._call(self._client.get_collections)
         return [collection.name for collection in response.collections]
 
     def _resolve_collection(self, collection_name: str | None) -> str:
@@ -88,11 +168,18 @@ class QdrantConnector:
             metadata=payload.get(METADATA_PATH),
             id=str(point.id),
             score=score,
+            created_at=payload.get(CREATED_AT_PATH),
+            updated_at=payload.get(UPDATED_AT_PATH),
         )
 
     async def store(self, entry: Entry, *, collection_name: str | None = None) -> Entry:
         """
         Store some information in the Qdrant collection, along with the specified metadata.
+
+        When deduplication is enabled, an entry whose content and metadata match an
+        existing one is not written again: the existing entry is returned with
+        ``duplicate=True``.
+
         :param entry: The entry to store in the Qdrant collection.
         :param collection_name: The name of the collection to store the information in, optional. If not provided,
                                 the default collection is used.
@@ -104,6 +191,14 @@ class QdrantConnector:
         collection_name = self._resolve_collection(collection_name)
         await self._ensure_collection_exists(collection_name)
 
+        fingerprint = content_fingerprint(entry.content, entry.metadata)
+
+        if self._dedupe:
+            existing = await self._find_by_fingerprint(collection_name, fingerprint)
+            if existing is not None:
+                existing.duplicate = True
+                return existing
+
         # Embed the document
         # ToDo: instead of embedding text explicitly, use `models.Document`,
         # it should unlock usage of server-side inference.
@@ -112,18 +207,56 @@ class QdrantConnector:
         # Add to Qdrant
         vector_name = self._embedding_provider.get_vector_name()
         point_id = uuid.uuid4().hex
-        payload = {DOCUMENT_PATH: entry.content, METADATA_PATH: entry.metadata}
-        await self._client.upsert(
-            collection_name=collection_name,
-            points=[
-                models.PointStruct(
-                    id=point_id,
-                    vector={vector_name: embeddings[0]},
-                    payload=payload,
-                )
-            ],
+        now = _utc_now()
+        payload = {
+            DOCUMENT_PATH: entry.content,
+            METADATA_PATH: entry.metadata,
+            CONTENT_HASH_PATH: fingerprint,
+            CREATED_AT_PATH: now,
+            UPDATED_AT_PATH: now,
+        }
+        await self._call(
+            lambda: self._client.upsert(
+                collection_name=collection_name,
+                points=[
+                    models.PointStruct(
+                        id=point_id,
+                        vector={vector_name: embeddings[0]},
+                        payload=payload,
+                    )
+                ],
+            )
         )
-        return Entry(content=entry.content, metadata=entry.metadata, id=point_id)
+        return Entry(
+            content=entry.content,
+            metadata=entry.metadata,
+            id=point_id,
+            created_at=now,
+            updated_at=now,
+        )
+
+    async def _find_by_fingerprint(
+        self, collection_name: str, fingerprint: str
+    ) -> Entry | None:
+        points, _ = await self._call(
+            lambda: self._client.scroll(
+                collection_name=collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key=CONTENT_HASH_PATH,
+                            match=models.MatchValue(value=fingerprint),
+                        )
+                    ]
+                ),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+        )
+        if not points:
+            return None
+        return self._entry_from_point(points[0])
 
     async def search(
         self,
@@ -146,7 +279,9 @@ class QdrantConnector:
         :return: A list of entries found, each carrying its id and similarity score.
         """
         collection_name = self._resolve_collection(collection_name)
-        collection_exists = await self._client.collection_exists(collection_name)
+        collection_exists = await self._call(
+            lambda: self._client.collection_exists(collection_name)
+        )
         if not collection_exists:
             return []
 
@@ -158,13 +293,15 @@ class QdrantConnector:
         vector_name = self._embedding_provider.get_vector_name()
 
         # Search in Qdrant
-        search_results = await self._client.query_points(
-            collection_name=collection_name,
-            query=query_vector,
-            using=vector_name,
-            limit=limit,
-            query_filter=query_filter,
-            score_threshold=score_threshold,
+        search_results = await self._call(
+            lambda: self._client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                using=vector_name,
+                limit=limit,
+                query_filter=query_filter,
+                score_threshold=score_threshold,
+            )
         )
 
         return [
@@ -183,7 +320,9 @@ class QdrantConnector:
         :return: The entry, or None when the collection or the point does not exist.
         """
         collection_name = self._resolve_collection(collection_name)
-        if not await self._client.collection_exists(collection_name):
+        if not await self._call(
+            lambda: self._client.collection_exists(collection_name)
+        ):
             return None
 
         points = await self._retrieve(collection_name, point_id)
@@ -227,11 +366,13 @@ class QdrantConnector:
         self, collection_name: str, point_id: str | int
     ) -> list[models.Record]:
         for candidate in self._id_candidates(point_id):
-            points = await self._client.retrieve(
-                collection_name=collection_name,
-                ids=[candidate],
-                with_payload=True,
-                with_vectors=False,
+            points = await self._call(
+                lambda c=candidate: self._client.retrieve(
+                    collection_name=collection_name,
+                    ids=[c],
+                    with_payload=True,
+                    with_vectors=False,
+                )
             )
             if points:
                 return points
@@ -275,7 +416,9 @@ class QdrantConnector:
 
         collection_name = self._resolve_collection(collection_name)
 
-        if not await self._client.collection_exists(collection_name):
+        if not await self._call(
+            lambda: self._client.collection_exists(collection_name)
+        ):
             raise ValueError(f"Collection '{collection_name}' does not exist.")
 
         existing = await self._retrieve(collection_name, point_id)
@@ -296,32 +439,44 @@ class QdrantConnector:
         elif metadata is not None:
             payload[METADATA_PATH] = metadata
 
+        payload[CONTENT_HASH_PATH] = content_fingerprint(
+            payload.get(DOCUMENT_PATH, ""), payload.get(METADATA_PATH)
+        )
+        payload[UPDATED_AT_PATH] = _utc_now()
+        payload.setdefault(CREATED_AT_PATH, payload[UPDATED_AT_PATH])
+
         if content is not None:
             # Single atomic write: vector and payload land together.
             embeddings = await self._embedding_provider.embed_documents([content])
             vector_name = self._embedding_provider.get_vector_name()
-            await self._client.upsert(
-                collection_name=collection_name,
-                points=[
-                    models.PointStruct(
-                        id=point_id,
-                        vector={vector_name: embeddings[0]},
-                        payload=payload,
-                    )
-                ],
+            await self._call(
+                lambda: self._client.upsert(
+                    collection_name=collection_name,
+                    points=[
+                        models.PointStruct(
+                            id=point_id,
+                            vector={vector_name: embeddings[0]},
+                            payload=payload,
+                        )
+                    ],
+                )
             )
         else:
             # Metadata-only change: rewrite the payload, leave the vector alone.
-            await self._client.overwrite_payload(
-                collection_name=collection_name,
-                payload=payload,
-                points=[point_id],
+            await self._call(
+                lambda: self._client.overwrite_payload(
+                    collection_name=collection_name,
+                    payload=payload,
+                    points=[point_id],
+                )
             )
 
         return Entry(
             content=payload.get(DOCUMENT_PATH, ""),
             metadata=payload.get(METADATA_PATH),
             id=str(point_id),
+            created_at=payload.get(CREATED_AT_PATH),
+            updated_at=payload.get(UPDATED_AT_PATH),
         )
 
     async def delete(
@@ -358,7 +513,9 @@ class QdrantConnector:
             raise ValueError("Provide exactly one of 'query' or 'point_id' to delete.")
 
         collection_name = self._resolve_collection(collection_name)
-        if not await self._client.collection_exists(collection_name):
+        if not await self._call(
+            lambda: self._client.collection_exists(collection_name)
+        ):
             return []
 
         if point_id is not None:
@@ -368,13 +525,15 @@ class QdrantConnector:
             assert query is not None
             query_vector = await self._embedding_provider.embed_query(query)
             vector_name = self._embedding_provider.get_vector_name()
-            results = await self._client.query_points(
-                collection_name=collection_name,
-                query=query_vector,
-                using=vector_name,
-                limit=limit,
-                query_filter=query_filter,
-                score_threshold=score_threshold,
+            results = await self._call(
+                lambda: self._client.query_points(
+                    collection_name=collection_name,
+                    query=query_vector,
+                    using=vector_name,
+                    limit=limit,
+                    query_filter=query_filter,
+                    score_threshold=score_threshold,
+                )
             )
             entries = [
                 self._entry_from_point(result, score=result.score)
@@ -385,18 +544,77 @@ class QdrantConnector:
             return entries
 
         point_ids = [entry.id for entry in entries if entry.id is not None]
-        await self._client.delete(
-            collection_name=collection_name,
-            points_selector=models.PointIdsList(points=point_ids),
+        await self._call(
+            lambda: self._client.delete(
+                collection_name=collection_name,
+                points_selector=models.PointIdsList(points=point_ids),
+            )
         )
         return entries
+
+    async def list_entries(
+        self,
+        *,
+        collection_name: str | None = None,
+        limit: int = 20,
+        offset: str | None = None,
+        query_filter: models.Filter | None = None,
+    ) -> tuple[list[Entry], str | None]:
+        """
+        Page through the collection without a semantic query.
+
+        :param collection_name: The name of the collection to read, optional. If not provided,
+                                the default collection is used.
+        :param limit: The maximum number of entries to return.
+        :param offset: The opaque cursor returned by a previous call, optional.
+        :param query_filter: The filter to apply, if any.
+        :return: The entries and the cursor for the next page, or None on the last page.
+        """
+        collection_name = self._resolve_collection(collection_name)
+        if not await self._call(
+            lambda: self._client.collection_exists(collection_name)
+        ):
+            return [], None
+
+        points, next_offset = await self._call(
+            lambda: self._client.scroll(
+                collection_name=collection_name,
+                scroll_filter=query_filter,
+                limit=limit,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+        )
+        return [self._entry_from_point(point) for point in points], (
+            str(next_offset) if next_offset is not None else None
+        )
+
+    async def count(self, *, collection_name: str | None = None) -> int:
+        """
+        Count the entries in a collection.
+        :param collection_name: The name of the collection to count, optional. If not provided,
+                                the default collection is used.
+        :return: The number of entries, or 0 when the collection does not exist.
+        """
+        collection_name = self._resolve_collection(collection_name)
+        if not await self._call(
+            lambda: self._client.collection_exists(collection_name)
+        ):
+            return 0
+        result = await self._call(
+            lambda: self._client.count(collection_name=collection_name, exact=True)
+        )
+        return result.count
 
     async def _ensure_collection_exists(self, collection_name: str):
         """
         Ensure that the collection exists, creating it if necessary.
         :param collection_name: The name of the collection to ensure exists.
         """
-        collection_exists = await self._client.collection_exists(collection_name)
+        collection_exists = await self._call(
+            lambda: self._client.collection_exists(collection_name)
+        )
         if not collection_exists:
             # Create the collection with the appropriate vector size
             vector_size = self._embedding_provider.get_vector_size()
@@ -404,27 +622,47 @@ class QdrantConnector:
             # Use the vector name as defined in the embedding provider
             vector_name = self._embedding_provider.get_vector_name()
             try:
-                await self._client.create_collection(
-                    collection_name=collection_name,
-                    vectors_config={
-                        vector_name: models.VectorParams(
-                            size=vector_size,
-                            distance=models.Distance.COSINE,
-                        )
-                    },
+                await self._call(
+                    lambda: self._client.create_collection(
+                        collection_name=collection_name,
+                        vectors_config={
+                            vector_name: models.VectorParams(
+                                size=vector_size,
+                                distance=models.Distance.COSINE,
+                            )
+                        },
+                    )
                 )
             except Exception:
                 # Another writer may have created it between the check and the
                 # create. Only swallow the error if the collection now exists.
-                if not await self._client.collection_exists(collection_name):
+                if not await self._call(
+                    lambda: self._client.collection_exists(collection_name)
+                ):
                     raise
 
             # Create payload indexes if configured
 
             if self._field_indexes:
                 for field_name, field_type in self._field_indexes.items():
-                    await self._client.create_payload_index(
-                        collection_name=collection_name,
-                        field_name=field_name,
-                        field_schema=field_type,
+                    await self._call(
+                        lambda f=field_name,
+                        t=field_type: self._client.create_payload_index(
+                            collection_name=collection_name,
+                            field_name=f,
+                            field_schema=t,
+                        )
                     )
+
+        # The deduplication filter needs an index on the fingerprint field.
+        if self._dedupe:
+            try:
+                await self._call(
+                    lambda: self._client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=CONTENT_HASH_PATH,
+                        field_schema=models.PayloadSchemaType.KEYWORD,
+                    )
+                )
+            except Exception as exc:  # index already exists or server refused
+                logger.debug("content_hash index not created: %s", exc)

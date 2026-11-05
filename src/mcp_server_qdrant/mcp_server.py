@@ -86,6 +86,8 @@ class QdrantMCPServer(FastMCP):
             self.embedding_provider,
             qdrant_settings.local_path,
             make_indexes(qdrant_settings.filterable_fields_dict()),
+            dedupe=qdrant_settings.dedupe,
+            retries=qdrant_settings.retries,
         )
 
         super().__init__(name=name, instructions=instructions, **settings)
@@ -146,6 +148,11 @@ class QdrantMCPServer(FastMCP):
             except ValueError as e:
                 return f"Could not store the memory: {e}"
 
+            if stored.duplicate:
+                return (
+                    f"Already remembered, nothing written: {information} "
+                    f"(id: {stored.id}, collection: {collection_name})"
+                )
             return (
                 f"Remembered: {information} "
                 f"(id: {stored.id}, collection: {collection_name})"
@@ -365,10 +372,96 @@ class QdrantMCPServer(FastMCP):
                 lines.append(f"- id {entry.id}{score}: {preview}")
             return "\n".join(lines)
 
+        async def get(
+            ctx: Context,
+            point_id: Annotated[
+                str,
+                Field(
+                    description="The id of the memory to read, as returned in the "
+                    "'id' field by the find or list tools."
+                ),
+            ],
+            collection_name: Annotated[
+                str, Field(description="The collection the memory lives in")
+            ],
+        ) -> str:
+            """
+            Read one memory by its exact id.
+            :param ctx: The context for the request.
+            :param point_id: The id of the memory to read.
+            :param collection_name: The name of the collection the memory lives in.
+            :return: The memory, or a message saying it does not exist.
+            """
+            await ctx.debug(f"Reading entry {point_id} from Qdrant")
+
+            try:
+                entry = await self.qdrant_connector.get(
+                    point_id, collection_name=collection_name
+                )
+            except ValueError as e:
+                return f"Could not read entry {point_id}: {e}"
+
+            if entry is None:
+                return (
+                    f"No memory with id '{point_id}' in collection {collection_name}."
+                )
+            return self.format_entry(entry)
+
+        async def list_entries(
+            ctx: Context,
+            collection_name: Annotated[
+                str, Field(description="The collection to read")
+            ],
+            limit: Annotated[
+                int | None,
+                Field(
+                    description="Maximum number of memories to return. Defaults to 20."
+                ),
+            ] = None,
+            offset: Annotated[
+                str | None,
+                Field(
+                    description="Cursor returned as 'next_offset' by a previous call. "
+                    "Omit it to read the first page."
+                ),
+            ] = None,
+        ) -> str:
+            """
+            Page through the stored memories without a semantic query.
+            :param ctx: The context for the request.
+            :param collection_name: The name of the collection to read.
+            :param limit: Maximum number of memories to return, optional.
+            :param offset: Cursor for the next page, optional.
+            :return: The memories and the cursor for the next page.
+            """
+            await ctx.debug(f"Listing entries in {collection_name}")
+
+            try:
+                effective_limit = _clamp_limit(limit, 20)
+                entries, next_offset = await self.qdrant_connector.list_entries(
+                    collection_name=collection_name,
+                    limit=effective_limit,
+                    offset=offset,
+                )
+            except (ValueError, TypeError) as e:
+                return f"Could not list memories: {e}"
+
+            if not entries:
+                return f"No memories in collection {collection_name}."
+
+            lines = [f"{len(entries)} memory(ies) from {collection_name}:"]
+            for entry in entries:
+                lines.append(self.format_entry(entry))
+            if next_offset:
+                lines.append(f"next_offset: {next_offset}")
+            return "\n".join(lines)
+
         find_foo = find
         store_foo = store
         update_foo = update
         delete_foo = delete
+        get_foo = get
+        list_foo = list_entries
 
         filterable_conditions = (
             self.qdrant_settings.filterable_fields_dict_with_conditions()
@@ -395,11 +488,27 @@ class QdrantMCPServer(FastMCP):
                 delete_foo,
                 {"collection_name": self.qdrant_settings.collection_name},
             )
+            get_foo = make_partial_function(
+                get_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+            list_foo = make_partial_function(
+                list_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
 
         self.tool(
             find_foo,
             name="qdrant-find",
             description=self.tool_settings.tool_find_description,
+        )
+        self.tool(
+            get_foo,
+            name="qdrant-get",
+            description=self.tool_settings.tool_get_description,
+        )
+        self.tool(
+            list_foo,
+            name="qdrant-list",
+            description=self.tool_settings.tool_list_description,
         )
 
         if not self.qdrant_settings.read_only:

@@ -30,6 +30,16 @@ DEFAULT_TOOL_UPDATE_DESCRIPTION = (
     "with that id. You can update the content, the metadata, or both; anything you leave "
     "out is kept unchanged."
 )
+DEFAULT_TOOL_GET_DESCRIPTION = (
+    "Read one memory by its exact id, without a semantic search. Use it to confirm what "
+    "a memory contains before updating or deleting it, or to re-read a memory whose id "
+    "you already have."
+)
+DEFAULT_TOOL_LIST_DESCRIPTION = (
+    "Page through the stored memories in insertion order, without a semantic query. Use "
+    "it to audit or clean up the collection. Pass the returned 'next_offset' back as "
+    "'offset' to read the following page."
+)
 
 METADATA_PATH = "metadata"
 
@@ -54,6 +64,14 @@ class ToolSettings(BaseSettings):
     tool_delete_description: str = Field(
         default=DEFAULT_TOOL_DELETE_DESCRIPTION,
         validation_alias="TOOL_DELETE_DESCRIPTION",
+    )
+    tool_get_description: str = Field(
+        default=DEFAULT_TOOL_GET_DESCRIPTION,
+        validation_alias="TOOL_GET_DESCRIPTION",
+    )
+    tool_list_description: str = Field(
+        default=DEFAULT_TOOL_LIST_DESCRIPTION,
+        validation_alias="TOOL_LIST_DESCRIPTION",
     )
 
 
@@ -108,6 +126,8 @@ class QdrantSettings(BaseSettings):
     local_path: str | None = Field(default=None, validation_alias="QDRANT_LOCAL_PATH")
     search_limit: int = Field(default=10, validation_alias="QDRANT_SEARCH_LIMIT")
     read_only: bool = Field(default=False, validation_alias="QDRANT_READ_ONLY")
+    dedupe: bool = Field(default=True, validation_alias="QDRANT_DEDUPE")
+    retries: int = Field(default=3, validation_alias="QDRANT_RETRIES")
 
     filterable_fields: list[FilterableField] | None = Field(default=None)
 

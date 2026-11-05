@@ -65,6 +65,31 @@ It acts as a semantic memory layer on top of the Qdrant database.
                                    If there is a default collection name, this field is not enabled.
    - Returns: The `id`, the `score` and a preview of every deleted entry, or of every match when `dry_run` is set.
    - This tool is disabled when `QDRANT_READ_ONLY` is enabled.
+5. `qdrant-get`
+   - Read one entry by its exact `id`, without a semantic search.
+   - Input:
+     - `point_id` (string): The `id` of the entry to read.
+     - `collection_name` (string): Name of the collection the entry lives in. This field is required if there is no default collection name.
+                                   If there is a default collection name, this field is not enabled.
+   - Returns: The entry, or a message saying it does not exist.
+6. `qdrant-list`
+   - Page through the stored entries in insertion order, without a semantic query.
+   - Input:
+     - `limit` (integer): Optional page size. Defaults to 20, capped at 100.
+     - `offset` (string): Optional cursor, the `next_offset` returned by a previous call.
+     - `collection_name` (string): Name of the collection to read. This field is required if there is no default collection name.
+                                   If there is a default collection name, this field is not enabled.
+   - Returns: The entries of the page and the cursor for the next one.
+
+### Payload fields written by the server
+
+| Field          | Meaning                                                              |
+|----------------|----------------------------------------------------------------------|
+| `document`     | The memory text.                                                     |
+| `metadata`     | The JSON metadata supplied by the caller.                            |
+| `content_hash` | SHA-256 of the normalized text plus the canonical metadata. Used to skip duplicate writes. |
+| `created_at`   | ISO 8601 UTC timestamp of the first write.                           |
+| `updated_at`   | ISO 8601 UTC timestamp of the last write.                            |
 
 ## Environment Variables
 
@@ -85,8 +110,12 @@ Configuration is done via environment variables. The only command-line argument 
 | `TOOL_FIND_DESCRIPTION`  | Custom description for the find tool                                | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
 | `TOOL_UPDATE_DESCRIPTION`| Custom description for the update tool                              | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
 | `TOOL_DELETE_DESCRIPTION`| Custom description for the delete tool                              | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
+| `TOOL_GET_DESCRIPTION`   | Custom description for the get tool                                 | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
+| `TOOL_LIST_DESCRIPTION`  | Custom description for the list tool                                | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
 | `QDRANT_SEARCH_LIMIT`    | Maximum number of results to return from search                     | `10`                                                              |
 | `QDRANT_READ_ONLY`       | Enable read-only mode (disables mutation tools)                      | `false`                                                           |
+| `QDRANT_DEDUPE`          | Skip a write when the same content and metadata already exist        | `true`                                                            |
+| `QDRANT_RETRIES`         | Attempts for a call that fails on a transient connection error       | `3`                                                               |
 
 ### FastMCP Environment Variables
 
